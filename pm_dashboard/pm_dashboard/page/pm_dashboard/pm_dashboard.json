@@ -1,0 +1,19 @@
+{
+ "content": null,
+ "creation": "2026-10-22 18:57:08.805608",
+ "docstatus": 0,
+ "doctype": "Page",
+ "idx": 0,
+ "modified": "2026-10-22 18:57:08.805608",
+ "modified_by": "Administrator",
+ "module": "PM Dashboard",
+ "name": "pm-dashboard",
+ "owner": "Administrator",
+ "page_name": "pm-dashboard",
+ "roles": [],
+ "script": null,
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "PM Dashboard"
+}
