@@ -28,6 +28,7 @@ class PMDashboard {
     // ------------------------------------------------------------ filters
 
     make_filters() {
+        this.opts = {};
         this.load_debounced = frappe.utils.debounce(() => this.load(), 300);
         const cascade = () => this.load_options(() => this.load_debounced());
 
@@ -41,6 +42,13 @@ class PMDashboard {
             return ctrl;
         };
 
+        // Link search only offers values that fit the other selected filters
+        const narrow = (key) => () => {
+            const list = this.opts && this.opts[key];
+            if (!list) return {};
+            return { filters: { name: ['in', list.map(i => i.value)] } };
+        };
+
         this.from_ctrl = make({
             fieldname: 'from_date', label: __('From Date'), fieldtype: 'Date',
             change: () => this.load_debounced()
@@ -52,53 +60,51 @@ class PMDashboard {
 
         this.building_ctrl = make({
             fieldname: 'building', label: __('Building'), fieldtype: 'Link', options: 'Building',
-            get_query: () => {
-                const filters = {};
-                const block = this.block_ctrl ? this.block_ctrl.get_value() : '';
-                if (block) filters.block_number = block;
-                return { filters: filters };
-            },
-            change: cascade
+            get_query: narrow('buildings'), change: cascade
         });
-
         this.block_ctrl = make({
-            fieldname: 'block_number', label: __('Building Block'), fieldtype: 'Data',
-            change: cascade
+            fieldname: 'building_block', label: __('Building Block'), fieldtype: 'Link',
+            options: 'Building Block', get_query: narrow('building_blocks'), change: cascade
         });
-
+        this.floor_ctrl = make({
+            fieldname: 'floor', label: __('Floor'), fieldtype: 'Link', options: 'Floor',
+            get_query: narrow('floors'), change: cascade
+        });
         this.property_ctrl = make({
             fieldname: 'property', label: __('Property'), fieldtype: 'Link', options: 'Property',
-            get_query: () => {
-                const filters = {};
-                const building = this.building_ctrl.get_value();
-                const block = this.block_ctrl.get_value();
-                if (building) filters.building = building;
-                if (block) filters.block_number = block;
-                return { filters: filters };
-            },
-            change: () => this.load_debounced()
+            get_query: narrow('properties'), change: () => this.load_debounced()
         });
 
         $('<button class="btn btn-default btn-sm" style="margin-bottom:var(--margin-md, 12px)">Clear</button>')
             .appendTo($wrap)
             .on('click', () => {
-                ['from_ctrl', 'to_ctrl', 'building_ctrl', 'block_ctrl', 'property_ctrl']
+                ['from_ctrl', 'to_ctrl', 'building_ctrl', 'block_ctrl', 'floor_ctrl', 'property_ctrl']
                     .forEach(k => this[k].set_value(''));
-                this.load_debounced();
+                this.load_options(() => this.load_debounced());
             });
+
+        this.load_options();
     }
 
     load_options(done) {
         const f = this.filters();
         frappe.call({
             method: PM_API + 'get_filter_options',
-            args: { building: f.building, block_number: f.block_number, property: f.property },
+            args: {
+                building: f.building,
+                building_block: f.building_block,
+                floor: f.floor,
+                property: f.property
+            },
             callback: (r) => {
                 const o = r.message || {};
+                this.opts = o;
                 // clear selections that no longer fit the other filters
-                const valid = (list, v) => !v || list.some(i => String(i.value) === String(v));
-                if (!valid(o.buildings || [], f.building)) this.building_ctrl.set_value('');
-                if (!valid(o.properties || [], f.property)) this.property_ctrl.set_value('');
+                const valid = (list, v) => !v || (list || []).some(i => String(i.value) === String(v));
+                if (!valid(o.buildings, f.building)) this.building_ctrl.set_value('');
+                if (!valid(o.building_blocks, f.building_block)) this.block_ctrl.set_value('');
+                if (!valid(o.floors, f.floor)) this.floor_ctrl.set_value('');
+                if (!valid(o.properties, f.property)) this.property_ctrl.set_value('');
                 if (done) done();
             }
         });
@@ -114,7 +120,8 @@ class PMDashboard {
             from_date: from_date,
             to_date: to_date,
             building: this.building_ctrl ? (this.building_ctrl.get_value() || '') : '',
-            block_number: this.block_ctrl ? ((this.block_ctrl.get_value() || '').trim()) : '',
+            building_block: this.block_ctrl ? (this.block_ctrl.get_value() || '') : '',
+            floor: this.floor_ctrl ? (this.floor_ctrl.get_value() || '') : '',
             property: this.property_ctrl ? (this.property_ctrl.get_value() || '') : ''
         };
     }

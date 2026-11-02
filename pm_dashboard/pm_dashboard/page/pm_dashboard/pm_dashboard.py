@@ -13,15 +13,23 @@ def _run(errors, key, query, values=None):
         return []
 
 
-def _unit_filters(building="", block_number="", prop=""):
+def _check_access():
+    # the page roles only control who can open the page; raw SQL needs its own check
+    frappe.has_permission("Rent Contract", "read", throw=True)
+
+
+def _unit_filters(building="", building_block="", floor="", prop=""):
     sql = ""
     values = {}
     if building:
         sql += " AND u.building = %(building)s"
         values["building"] = building
-    if block_number:
-        sql += " AND u.block_number = %(block_number)s"
-        values["block_number"] = block_number
+    if building_block:
+        sql += " AND u.building_block = %(building_block)s"
+        values["building_block"] = building_block
+    if floor:
+        sql += " AND u.floor = %(floor)s"
+        values["floor"] = floor
     if prop:
         sql += " AND u.name = %(prop)s"
         values["prop"] = prop
@@ -47,7 +55,7 @@ _UNITS = """
     SELECT
         u.name AS unit,
         u.building AS building,
-        u.block_number AS block_number,
+        u.building_block AS building_block,
         COALESCE(b.building_name, u.building) AS property_name,
         CASE WHEN EXISTS (
             SELECT 1 FROM `tabRent Contract` rc
@@ -60,16 +68,16 @@ _UNITS = """
     WHERE 1=1 """
 
 
-def _overview(errors, building="", block_number="", prop=""):
-    where, values = _unit_filters(building, block_number, prop)
+def _overview(errors, building="", building_block="", floor="", prop=""):
+    where, values = _unit_filters(building, building_block, floor, prop)
     units = _UNITS + where
 
     summary = _run(errors, "summary", """
         SELECT
             COUNT(DISTINCT property_name) AS total_properties,
             COUNT(DISTINCT building) AS total_buildings,
-            COUNT(DISTINCT CASE WHEN COALESCE(block_number, '') <> ''
-                  THEN CONCAT(COALESCE(building, ''), '|', block_number) END) AS total_blocks,
+            COUNT(DISTINCT CASE WHEN COALESCE(building_block, '') <> ''
+                  THEN CONCAT(COALESCE(building, ''), '|', building_block) END) AS total_blocks,
             COUNT(*) AS total_units,
             COALESCE(SUM(is_occupied), 0) AS occupied_units,
             COUNT(*) - COALESCE(SUM(is_occupied), 0) AS vacant_units,
@@ -118,7 +126,7 @@ _VACANT_UNITS = """
             DATE(u.modified))) AS days_vacant
     FROM `tabProperty` u
     LEFT JOIN `tabBuilding` b ON b.name = u.building
-    WHERE u.status <> 'Rented'
+    WHERE COALESCE(u.status, '') <> 'Rented'
       AND NOT EXISTS (
         SELECT 1 FROM `tabRent Contract` rc
         WHERE rc.property = u.name AND rc.docstatus = 1
@@ -137,8 +145,8 @@ def _rank(rows, entity_type):
     return rows
 
 
-def _vacancy(errors, building="", block_number="", prop=""):
-    where, values = _unit_filters(building, block_number, prop)
+def _vacancy(errors, building="", building_block="", floor="", prop=""):
+    where, values = _unit_filters(building, building_block, floor, prop)
     vacant = _VACANT_UNITS + where
 
     by_property = _run(errors, "vacancy", """
@@ -209,8 +217,8 @@ def _blank_month(period_month):
     }
 
 
-def _revenue(errors, from_date, to_date, building="", block_number="", prop=""):
-    unit_sql, values = _unit_filters(building, block_number, prop)
+def _revenue(errors, from_date, to_date, building="", building_block="", floor="", prop=""):
+    unit_sql, values = _unit_filters(building, building_block, floor, prop)
     inv_sql, v1 = _range("si.posting_date", "m", from_date, to_date, month=True)
     pay_sql, v2 = _range("pe.posting_date", "m", from_date, to_date, month=True)
     ex_sql, v3 = _range("rc.contract_end_date2", "d", from_date, to_date)
@@ -342,43 +350,70 @@ def _revenue(errors, from_date, to_date, building="", block_number="", prop=""):
 
 @frappe.whitelist()
 def get_dashboard(tab="overview", from_date="", to_date="",
-                  building="", block_number="", property=""):
+                  building="", building_block="", floor="", property=""):
+    _check_access()
     errors = {}
     from_date = from_date or ""
     to_date = to_date or ""
     building = building or ""
-    block_number = block_number or ""
+    building_block = building_block or ""
+    floor = floor or ""
     prop = property or ""
 
     if tab == "vacancy":
-        result = _vacancy(errors, building, block_number, prop)
+        result = _vacancy(errors, building, building_block, floor, prop)
     elif tab == "revenue":
-        result = _revenue(errors, from_date, to_date, building, block_number, prop)
+        result = _revenue(errors, from_date, to_date, building, building_block, floor, prop)
     else:
-        result = _overview(errors, building, block_number, prop)
+        result = _overview(errors, building, building_block, floor, prop)
 
     result["errors"] = errors
     return result
 
 
+def _opt_where(skip, building, building_block, floor):
+    # every selected filter except the list's own one, so the user can still switch it
+    sql = ""
+    values = {}
+    if building and skip != "building":
+        sql += " AND u.building = %(building)s"
+        values["building"] = building
+    if building_block and skip != "building_block":
+        sql += " AND u.building_block = %(building_block)s"
+        values["building_block"] = building_block
+    if floor and skip != "floor":
+        sql += " AND u.floor = %(floor)s"
+        values["floor"] = floor
+    return sql, values
+
+
 @frappe.whitelist()
-def get_filter_options(building="", block_number="", property=""):
-    v = {"building": building or "", "block_number": block_number or ""}
-    by_block = " AND u.block_number = %(block_number)s" if block_number else ""
-    by_building = " AND u.building = %(building)s" if building else ""
+def get_filter_options(building="", building_block="", floor="", property=""):
+    _check_access()
+    building = building or ""
+    building_block = building_block or ""
+    floor = floor or ""
 
+    w, v = _opt_where("building", building, building_block, floor)
     buildings = frappe.db.sql(
-        "SELECT DISTINCT b.name AS value, COALESCE(b.building_name, b.name) AS label "
-        "FROM `tabBuilding` b JOIN `tabProperty` u ON u.building = b.name "
-        "WHERE 1=1" + by_block + " ORDER BY label", v, as_dict=True)
+        "SELECT DISTINCT u.building AS value, COALESCE(b.building_name, u.building) AS label "
+        "FROM `tabProperty` u LEFT JOIN `tabBuilding` b ON b.name = u.building "
+        "WHERE COALESCE(u.building, '') <> ''" + w + " ORDER BY label", v, as_dict=True)
 
-    blocks = frappe.db.sql(
-        "SELECT DISTINCT u.block_number AS value FROM `tabProperty` u "
-        "WHERE COALESCE(u.block_number, '') <> ''" + by_building +
-        " ORDER BY u.block_number", v, as_dict=True)
+    w, v = _opt_where("building_block", building, building_block, floor)
+    building_blocks = frappe.db.sql(
+        "SELECT DISTINCT u.building_block AS value FROM `tabProperty` u "
+        "WHERE COALESCE(u.building_block, '') <> ''" + w + " ORDER BY value", v, as_dict=True)
 
+    w, v = _opt_where("floor", building, building_block, floor)
+    floors = frappe.db.sql(
+        "SELECT DISTINCT u.floor AS value FROM `tabProperty` u "
+        "WHERE COALESCE(u.floor, '') <> ''" + w + " ORDER BY value", v, as_dict=True)
+
+    w, v = _opt_where("", building, building_block, floor)
     properties = frappe.db.sql(
         "SELECT u.name AS value, COALESCE(u.apt_no, u.name) AS label FROM `tabProperty` u "
-        "WHERE 1=1" + by_building + by_block + " ORDER BY label", v, as_dict=True)
+        "WHERE 1=1" + w + " ORDER BY label", v, as_dict=True)
 
-    return {"buildings": buildings, "blocks": blocks, "properties": properties}
+    return {"buildings": buildings, "building_blocks": building_blocks,
+            "floors": floors, "properties": properties}
