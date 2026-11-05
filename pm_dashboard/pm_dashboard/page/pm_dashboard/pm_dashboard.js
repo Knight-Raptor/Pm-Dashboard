@@ -24,6 +24,7 @@ class PMDashboard {
         };
         this.make_layout();
         this.make_filters();
+        this.toggle_date_filters();
         this.page.set_primary_action(__('Refresh'), () => this.load(), 'refresh');
         this.load();
     }
@@ -118,9 +119,18 @@ class PMDashboard {
                 .appendTo(this.$tabs)
                 .on('click', () => {
                     this.tab = key;
+                    this.toggle_date_filters();
                     this.load();
                 });
         });
+    }
+
+    toggle_date_filters() {
+        // Date filters are visible only on the Revenue & Collections tab.
+        // Selected date values are preserved when switching tabs.
+        const show = this.tab === 'revenue';
+        if (this.$from_wrapper) this.$from_wrapper.toggle(show);
+        if (this.$to_wrapper) this.$to_wrapper.toggle(show);
     }
 
     make_filters() {
@@ -130,10 +140,16 @@ class PMDashboard {
             const $container = $('<div class="pm-filter"></div>').appendTo(this.$filters);
             const control = frappe.ui.form.make_control({ parent: $container, df, render_input: true });
             control.refresh();
-            return control;
+            return { control, $container };
         };
-        this.from = make({ fieldname: 'from_date', label: __('From Date'), fieldtype: 'Date', change: () => this.load_debounced() });
-        this.to = make({ fieldname: 'to_date', label: __('To Date'), fieldtype: 'Date', change: () => this.load_debounced() });
+        // Date filters are visible only on the Revenue & Collections tab.
+        // They stay inline in the same flex row as the other filters.
+        const from = make({ fieldname: 'from_date', label: __('From Date'), fieldtype: 'Date', change: () => this.load_debounced() });
+        this.from = from.control;
+        this.$from_wrapper = from.$container;
+        const to = make({ fieldname: 'to_date', label: __('To Date'), fieldtype: 'Date', change: () => this.load_debounced() });
+        this.to = to.control;
+        this.$to_wrapper = to.$container;
         // No default date filters — start with no date range (all time)
 
         const narrow = (key) => () => {
@@ -141,10 +157,10 @@ class PMDashboard {
             return values.length ? { filters: { name: ['in', values] } } : { filters: { name: ['=', '__none__'] } };
         };
         const cascade = () => this.load_options(() => this.load_debounced());
-        this.building = make({ fieldname: 'building', label: __('Building'), fieldtype: 'Link', options: 'Building', get_query: narrow('buildings'), change: cascade });
-        this.block = make({ fieldname: 'building_block', label: __('Building Block'), fieldtype: 'Link', options: 'Building Block', get_query: narrow('building_blocks'), change: cascade });
-        this.floor = make({ fieldname: 'floor', label: __('Floor'), fieldtype: 'Link', options: 'Floor', get_query: narrow('floors'), change: cascade });
-        this.property = make({ fieldname: 'property', label: __('Property'), fieldtype: 'Link', options: 'Property', get_query: narrow('properties'), change: () => this.load_debounced() });
+        this.building = make({ fieldname: 'building', label: __('Building'), fieldtype: 'Link', options: 'Building', get_query: narrow('buildings'), change: cascade }).control;
+        this.block = make({ fieldname: 'building_block', label: __('Building Block'), fieldtype: 'Link', options: 'Building Block', get_query: narrow('building_blocks'), change: cascade }).control;
+        this.floor = make({ fieldname: 'floor', label: __('Floor'), fieldtype: 'Link', options: 'Floor', get_query: narrow('floors'), change: cascade }).control;
+        this.property = make({ fieldname: 'property', label: __('Property'), fieldtype: 'Link', options: 'Property', get_query: narrow('properties'), change: () => this.load_debounced() }).control;
 
         $('<button type="button" class="btn btn-default btn-sm" style="margin-bottom:var(--margin-md,12px)"></button>')
             .text(__('Reset'))
@@ -285,7 +301,7 @@ class PMDashboard {
         const silent = new Set([
             "overview.total_area", "overview.occupied_area", "overview.occupancy_rate",
             "overview.area_occupancy_rate",
-            "revenue.collection_rate", "vacancy.vacancy_rate", "vacancy.revenue_loss",
+            "revenue.collection_rate", "vacancy.vacancy_rate",
         ]);
         this.$body.find('.pm-kpi').on('click', (event) => {
             const card = byKey[$(event.currentTarget).attr('data-kpi')];
@@ -340,6 +356,7 @@ class PMDashboard {
         const active = data.tables && data.tables.active_contracts || [];
         const awaiting = data.tables && data.tables.expiries || [];
         const prebooked = data.tables && data.tables.pre_booked || [];
+        const chart = (data.charts && data.charts.awaiting_renewal) || [];
         const activeRows = active.map(row => [
             row.tenant, row.property_label, row.building,
             this.money(row.monthly), this.date(row.start), this.date(row.end)
@@ -353,6 +370,7 @@ class PMDashboard {
             this.money(row.monthly), this.date(row.start), this.date(row.end)
         ]);
         return `
+            ${chart.length ? `<section class="pm-panel"><div class="pm-section-title"><h4>${__('Awaiting Renewal')}</h4><span>${__('Contracts expiring month by month')}</span></div><div id="pm-chart-awaiting-renewal" class="pm-chart"></div></section>` : ''}
             <div class="pm-grid-2">
                 <section class="pm-panel"><div class="pm-section-title"><h4>${__('Active Contract Register')}</h4><span>${active.length} ${__('contracts')}</span></div>
                     ${this.table(['Tenant', 'Unit', 'Building', 'Monthly Rent', 'Start', 'End'], activeRows)}</section>
@@ -400,6 +418,15 @@ class PMDashboard {
             if (duration.length) this.make_chart('#pm-chart-vacancy-duration', 'bar', ['#e9a23b'], duration.map(r => r.bucket), [
                 { name: __('Units'), values: duration.map(r => this.number(r.units)) }
             ]);
+        } else if (this.tab === 'contract_value') {
+            // Awaiting Renewal chart: contracts expiring month by month.
+            const ar = data.charts && data.charts.awaiting_renewal || [];
+            if (ar.length) {
+                const labels = ar.map(m => moment(m.month).format('MMM YY'));
+                this.make_chart('#pm-chart-awaiting-renewal', 'bar', ['#2f8bdc'], labels, [
+                    { name: __('Contracts Expiring'), values: ar.map(m => this.number(m.count)) }
+                ], { barOptions: { spaceRatio: 0.4 } });
+            }
         }
     }
 

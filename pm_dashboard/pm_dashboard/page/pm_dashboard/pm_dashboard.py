@@ -133,7 +133,10 @@ class DashboardContext:
         self.errors = {}
         self._properties = None
         self._contracts = None
+        self._contract_groups = None
+        self._canonical_contracts = None
         self._invoices = None
+        self._customers = None
         self._exceptions = []
 
     def has_permission(self, doctype):
@@ -188,6 +191,28 @@ class DashboardContext:
         return [row.name for row in self.properties]
 
     @property
+    def customer_names(self):
+        """Batch-resolve Customer IDs to names for MPRC children whose
+        tenant_name is NULL (normal RCs may carry tenant_name directly)."""
+        if self._customers is not None:
+            return self._customers
+        tenant_ids = []
+        for c in self.contracts:
+            tenant = c.get("tenant")
+            if tenant and tenant not in tenant_ids:
+                tenant_ids.append(tenant)
+        names = {}
+        if tenant_ids and self.has_permission("Customer"):
+            rows = self.list_rows(
+                "Customer",
+                {"name": ["in", tenant_ids]},
+                ["name", "customer_name"],
+            )
+            names = {row.name: row.customer_name or row.name for row in rows}
+        self._customers = names
+        return names
+
+    @property
     def contracts(self):
         if self._contracts is not None:
             return self._contracts
@@ -235,6 +260,303 @@ class DashboardContext:
         return self._contracts
 
     @property
+    def contract_groups(self):
+        """Group Rent Contracts into canonical contract units:
+        - one normal RC -> one group keyed by its own name
+        - an MPRC parent + its child RCs -> one group keyed by the MPRC parent
+        MPRC child Rent Contracts are never counted as separate contracts;
+        each group aggregates its members' monthly rent and properties.
+        Ordinary RC extensions (extension_parent / extended_from on Rent
+        Contract) stay normal RCs and are never merged into an MPRC group.
+        """
+        if self._contract_groups is not None:
+            return self._contract_groups
+        customers = self.customer_names
+        groups = {}
+        order = []
+        for c in self.contracts:
+            mprc = c.get("mprc") or ""
+            key = mprc or c["name"]
+            if key not in groups:
+                groups[key] = {
+                    "key": key,
+                    "doctype": "Multi Property Rent Contract" if mprc else "Rent Contract",
+                    "name": key,
+                    "contract": key,
+                    "monthly": 0.0,
+                    "start": None,
+                    "end": None,
+                    "tenant": "",
+                    "tenant_name": "",
+                    "properties": [],
+                    "buildings": set(),
+                }
+                order.append(key)
+            g = groups[key]
+            g["monthly"] += flt(c.monthly)
+            if c.start and (g["start"] is None or c.start < g["start"]):
+                g["start"] = c.start
+            if c.end and (g["end"] is None or c.end > g["end"]):
+                g["end"] = c.end
+            tenant = c.get("tenant") or ""
+            if tenant and tenant != g["tenant"]:
+                g["tenant"] = tenant
+            tn = c.get("tenant_name") or ""
+            if tn:
+                g["tenant_name"] = tn
+            elif tenant and tenant not in (g.get("_tenants_seen") or set()):
+                g["tenant_name"] = customers.get(tenant, tenant)
+                g.setdefault("_tenants_seen", set()).add(tenant)
+            if c.property and c.property not in g["properties"]:
+                g["properties"].append(c.property)
+            if c.building:
+                g["buildings"].add(c.building)
+        result = []
+        for key in order:
+            g = groups[key]
+            g.pop("_tenants_seen", None)
+            if not g["tenant_name"] and g["tenant"]:
+                g["tenant_name"] = customers.get(g["tenant"], g["tenant"])
+            g["building"] = (
+                next(iter(g["buildings"])) if len(g["buildings"]) == 1 else "Multiple"
+            )
+            g["property_label"] = (
+                self.property_map.get(g["properties"][0], {}).apt_no or g["properties"][0]
+                if len(g["properties"]) == 1
+                else "{0} units".format(len(g["properties"]))
+            )
+            result.append(g)
+        self._contract_groups = result
+        return result
+
+    def active_contract_groups(self, target_date):
+        """Active contract groups (one per normal RC or MPRC parent) on a date."""
+        active = []
+        for g in self.contract_groups:
+            if g["start"] and g["end"] and g["start"] <= target_date <= g["end"]:
+                active.append(g)
+        return active
+
+    def _contract_status(self, start, end):
+        """Derive contract status per the Property Management app's
+        get_contract_status / update_status lifecycle:
+          start > today  -> Pre-Booked
+          end   < today  -> Expired
+          otherwise      -> Occupied
+        """
+        today = getdate()
+        if start and getdate(start) > today:
+            return "Pre-Booked"
+        if end and getdate(end) < today:
+            return "Expired"
+        return "Occupied"
+
+    def _prop_matches_filters(self, prop_name):
+        """Check whether a Property row matches the active location filters."""
+        prop_row = self.property_map.get(prop_name)
+        if not prop_row:
+            return False
+        if self.filters.get("building") and prop_row.building != self.filters["building"]:
+            return False
+        if self.filters.get("building_block") and prop_row.building_block != self.filters["building_block"]:
+            return False
+        if self.filters.get("floor") and prop_row.floor != self.filters["floor"]:
+            return False
+        if self.filters.get("property") and prop_name != self.filters["property"]:
+            return False
+        return True
+
+    @property
+    def canonical_contracts(self):
+        """One canonical row per normal Rent Contract and per Multi Property
+        Rent Contract parent.
+
+        Normal RCs: docstatus=1, not an MPRC child (multi_rent_contract_no empty).
+        MPRC parents: docstatus=1 Multi Property Rent Contract, with properties
+        resolved from the Rent Contract Multi Property child table. A parent is
+        included when at least one of its properties matches the location filters
+        (or when no location filter is set). Its child RC records are never
+        counted as independent contracts.
+
+        Status follows the app's own lifecycle: start > today -> Pre-Booked,
+        end < today -> Expired, otherwise Occupied.
+        """
+        if self._canonical_contracts is not None:
+            return self._canonical_contracts
+
+        today = getdate()
+        contracts = []
+        tenant_ids = []
+
+        def add_tenant(t):
+            if t and t not in tenant_ids:
+                tenant_ids.append(t)
+
+        # --- Normal Rent Contracts (exclude MPRC children) ---
+        property_names = self.property_names
+        rc_rows = []
+        if property_names:
+            rc_rows = self.list_rows(
+                "Rent Contract",
+                {
+                    "docstatus": 1,
+                    "property": ["in", property_names],
+                    "multi_rent_contract_no": ["", ""],
+                },
+                [
+                    "name", "property", "building", "tenant", "tenant_name",
+                    "contract_start_date", "contract_end_date", "monthly_payable_amount",
+                ],
+            )
+            for row in rc_rows:
+                add_tenant(row.tenant)
+
+        # --- MPRC Parents ---
+        mprc_rows = self.list_rows(
+            "Multi Property Rent Contract",
+            {"docstatus": 1},
+            ["name", "tenant", "contract_start_date", "contract_end_date", "monthly_payable_amount"],
+        )
+        mprc_properties = defaultdict(list)
+        mprc_buildings = defaultdict(set)
+        if mprc_rows:
+            mprc_names = [r.name for r in mprc_rows]
+            if self.has_permission("Rent Contract Multi Property"):
+                prop_rows = frappe.db.sql(
+                    """
+                    SELECT parent, property, building
+                    FROM `tabRent Contract Multi Property`
+                    WHERE parent IN %(parents)s
+                    """,
+                    {"parents": tuple(mprc_names)},
+                    as_dict=True,
+                )
+                for pr in prop_rows:
+                    if pr.property:
+                        mprc_properties[pr.parent].append(pr.property)
+                    if pr.building:
+                        mprc_buildings[pr.parent].add(pr.building)
+            for row in mprc_rows:
+                add_tenant(row.tenant)
+
+        # Resolve customer names (MPRC parents and RC children have tenant as
+        # a Customer link; tenant_name may be NULL on child records).
+        customers = {}
+        if tenant_ids and self.has_permission("Customer"):
+            cust_rows = self.list_rows(
+                "Customer", {"name": ["in", tenant_ids]}, ["name", "customer_name"]
+            )
+            customers = {r.name: r.customer_name or r.name for r in cust_rows}
+
+        has_location = _has_location_filter(self.filters)
+
+        # Build normal RC rows.
+        for row in rc_rows:
+            start = _date(row.contract_start_date)
+            end = _date(row.contract_end_date)
+            props = [row.property] if row.property else []
+            buildings = {row.building} if row.building else set()
+            contracts.append({
+                "name": row.name,
+                "document_name": row.name,
+                "doctype": "Rent Contract",
+                "property": row.property or "",
+                "building": row.building or "",
+                "tenant": row.tenant or "",
+                "tenant_name": row.tenant_name or customers.get(row.tenant, row.tenant or ""),
+                "contract_start_date": row.contract_start_date,
+                "contract_end_date": row.contract_end_date,
+                "monthly_payable_amount": flt(row.monthly_payable_amount),
+                "monthly": flt(row.monthly_payable_amount),
+                "start": start,
+                "end": end,
+                "status": self._contract_status(start, end),
+                "mprc": "",
+                "properties": props,
+                "buildings": buildings,
+            })
+
+        # Build MPRC parent rows.
+        for row in mprc_rows:
+            start = _date(row.contract_start_date)
+            end = _date(row.contract_end_date)
+            props = list(mprc_properties.get(row.name, []))
+            # Apply location filters: keep the parent only if at least one of
+            # its properties is visible under the current filters.
+            if has_location:
+                visible_props = [p for p in props if self._prop_matches_filters(p)]
+                if not visible_props:
+                    continue
+                props = visible_props
+            buildings = mprc_buildings.get(row.name, set())
+            building = (
+                next(iter(buildings)) if len(buildings) == 1
+                else ("Multiple" if buildings else "")
+            )
+            contracts.append({
+                "name": row.name,
+                "document_name": row.name,
+                "doctype": "Multi Property Rent Contract",
+                "property": "",
+                "building": building,
+                "tenant": row.tenant or "",
+                "tenant_name": customers.get(row.tenant, row.tenant or ""),
+                "contract_start_date": row.contract_start_date,
+                "contract_end_date": row.contract_end_date,
+                "monthly_payable_amount": flt(row.monthly_payable_amount),
+                "monthly": flt(row.monthly_payable_amount),
+                "start": start,
+                "end": end,
+                "status": self._contract_status(start, end),
+                "mprc": "",
+                "properties": props,
+                "buildings": buildings,
+            })
+
+        # Attach property_label to each contract (single unit -> apt_no/name;
+        # MPRC with multiple units -> "N units").
+        for c in contracts:
+            props = c.get("properties") or []
+            if len(props) == 1 and props[0]:
+                c["property_label"] = self.property_map.get(props[0], {}).apt_no or props[0]
+            elif props:
+                c["property_label"] = "{0} units".format(len(props))
+            else:
+                c["property_label"] = ""
+
+        self._canonical_contracts = contracts
+        return contracts
+
+    def rental_income_by_group(self, from_date, to_date):
+        """Prorated rental income per contract group over [from_date, to_date].
+
+        Same per-child proration as the historical card calculation, aggregated
+        under each group's canonical key (normal RC name or MPRC parent). Used
+        by both the Rental Income card and its popup so they can never diverge.
+        """
+        income = {}
+        for g in self.contract_groups:
+            total = 0.0
+            for c in self.contracts:
+                # Attribute each child contract to its group key.
+                mprc = c.get("mprc") or ""
+                key = mprc or c["name"]
+                if key != g["key"]:
+                    continue
+                if not c.start or not c.end:
+                    continue
+                for month in _months_between(from_date, to_date):
+                    seg_start = max(c.start, from_date, month)
+                    seg_end = min(c.end, to_date, _month_end(month))
+                    if seg_start > seg_end:
+                        continue
+                    days_in_month = _month_end(month).day
+                    days = (seg_end - seg_start).days + 1
+                    total += flt(c.monthly) * days / days_in_month
+            income[g["key"]] = round(total, 2)
+        return income
+
+    @property
     def invoices(self):
         if self._invoices is not None:
             return self._invoices
@@ -273,14 +595,36 @@ class DashboardContext:
                 rc = contract_map.get(inv.rent_contract or inv.contract_no)
                 if rc:
                     invoice_property = rc.property
+            # MPRC invoices carry the parent contract_no / multi_rent_contract_no
+            # and no header property: resolve via the MPRC parent's child RCs.
+            if not invoice_property:
+                mprc_name = inv.multi_rent_contract_no or inv.contract_no or ""
+                if mprc_name and mprc_name in mprc_contracts:
+                    visible = [
+                        c.property for c in mprc_contracts[mprc_name]
+                        if c.property and c.property in self.property_map
+                    ]
+                    if visible:
+                        invoice_property = ", ".join(visible)
+                    elif not has_location or not self.filters.get("building"):
+                        invoice_property = ""
             # Skip activity on invisible/non-leasable units.
             if invoice_property and invoice_property not in self.property_map:
-                continue
-            building = (
-                self.property_map[invoice_property].building
-                if invoice_property in self.property_map
-                else inv.building or cost_center_buildings.get(inv.cost_center) or ""
-            )
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if not visible_parts:
+                    continue
+                invoice_property = ", ".join(visible_parts)
+            building = ""
+            if invoice_property:
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if visible_parts:
+                    building = self.property_map[visible_parts[0]].building or ""
+                if not building:
+                    building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
+            else:
+                building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
             if has_location and self.filters["building"] and building != self.filters["building"]:
                 continue
             row = frappe._dict(inv.copy())
@@ -364,43 +708,43 @@ class DashboardContext:
         today = getdate()
         end = add_days(today, 30)
         rows = []
-        for c in self.contracts:
-            if today <= c.end <= end:
-                row = {
-                    "name": c["name"],
-                    "document_name": c["name"],
-                    "doctype": "Rent Contract",
-                    "contract": c["name"],
-                    "tenant": c.get("tenant_name") or c.get("tenant") or "",
-                    "property": c.property,
-                    "property_label": self.property_map.get(c.property, {}).apt_no or c.property,
-                    "building": c.building,
-                    "end_date": c.end,
-                    "days_to_expiry": (c.end - today).days,
-                    "monthly": c.monthly,
-                }
-                rows.append(row)
+        for c in self.canonical_contracts:
+            if not c["end"] or not (today <= c["end"] <= end):
+                continue
+            rows.append({
+                "name": c["name"],
+                "document_name": c["name"],
+                "doctype": c["doctype"],
+                "contract": c["name"],
+                "tenant": c["tenant_name"],
+                "property": ", ".join(c["properties"]),
+                "property_label": c["property_label"],
+                "building": c["building"],
+                "end_date": c["end"],
+                "days_to_expiry": (c["end"] - today).days,
+                "monthly": c["monthly"],
+            })
         return sorted(rows, key=lambda r: (r["end_date"], r["contract"]))
 
     def pre_booked(self):
         today = getdate()
-        end = add_months(today, 12)
         rows = []
-        for c in self.contracts:
-            if today < c.start <= end:
-                rows.append({
-                    "name": c["name"],
-                    "document_name": c["name"],
-                    "doctype": "Rent Contract",
-                    "contract": c["name"],
-                    "tenant": c.get("tenant_name") or c.get("tenant") or "",
-                    "property": c.property,
-                    "property_label": self.property_map.get(c.property, {}).apt_no or c.property,
-                    "building": c.building,
-                    "start": c.start,
-                    "end": c.end,
-                    "monthly": c.monthly,
-                })
+        for c in self.canonical_contracts:
+            if c["status"] != "Pre-Booked":
+                continue
+            rows.append({
+                "name": c["name"],
+                "document_name": c["name"],
+                "doctype": c["doctype"],
+                "contract": c["name"],
+                "tenant": c["tenant_name"],
+                "property": ", ".join(c["properties"]),
+                "property_label": c["property_label"],
+                "building": c["building"],
+                "start": c["start"],
+                "end": c["end"],
+                "monthly": c["monthly"],
+            })
         return sorted(rows, key=lambda r: (r["start"], r["contract"]))
 
     def vacancy_rows(self):
@@ -423,9 +767,9 @@ class DashboardContext:
             start = min(start, self.as_of)
             days = max(0, (self.as_of - start).days)
             rent = flt(prop.rent)
-            loss_start = max(start, self.from_date)
-            loss_end = min(self.as_of, self.to_date)
-            loss = prorated_monthly(rent, start, self.as_of, loss_start, loss_end) if loss_start <= loss_end else 0.0
+            # Potential Revenue Loss = full monthly Potential Rent of the vacant
+            # property. Not prorated by days vacant, not windowed by From/To date.
+            loss = rent
             area = flt(prop.total_area_of_property or prop.total_area or prop.area)
             rows.append({
                 "property": prop.name,
@@ -563,37 +907,35 @@ def _rows_for_kpi(ctx, kpi):
         ], {"expiring_30d": len(rows)}, []
 
     if kpi.startswith("revenue.rental_income_gl"):
-        # One row per contract (RC or its MPRC parent), never per-month, never
-        # child-expanded. Columns: Contract (link), Tenant, Start, End, Monthly Rent.
-        def contract_label(c):
-            mprc = c.get("multi_rent_contract_no") or c.get("mprc")
-            if mprc:
-                return {"doctype": "Multi Property Rent Contract", "name": mprc}
-            return {"doctype": "Rent Contract", "name": c["name"]}
-
-        seen = {}
-        for c in ctx.contracts:
-            label = contract_label(c)
-            key = label["name"]
-            if key not in seen:
-                seen[key] = {
-                    "contract": label["name"],
-                    "contract_doctype": label["doctype"],
-                    "source_doctype": label["doctype"],
-                    "source_name": label["name"],
-                    "tenant": c.get("tenant_name") or c.get("tenant") or "",
-                    "start": c.start,
-                    "end": c.end,
-                    "monthly": flt(c.monthly),
-                }
-        rows = list(seen.values())
+        # Exactly three columns: Tenant Name, Contract ID, Rental Income Generated.
+        # One row per contract (RC or its MPRC parent), never child-expanded.
+        # Income is the prorated period rental income per group, shared with the
+        # Rental Income card so the popup total always matches the KPI value.
+        income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
+        rows = []
+        for g in ctx.contract_groups:
+            rows.append({
+                "tenant_name": g["tenant_name"],
+                "tenant": g["tenant"],
+                "contract": g["name"],
+                "contract_doctype": g["doctype"],
+                "source_doctype": g["doctype"],
+                "source_name": g["name"],
+                "tenant_name__doctype": "Customer",
+                "tenant_name__docname": g["tenant"] or g["tenant_name"],
+                "contract__doctype": g["doctype"],
+                "contract__docname": g["name"],
+                "rental_income": income_by_group.get(g["key"], 0.0),
+            })
+        totals = {
+            "rental_income": round(sum(income_by_group.values()), 2),
+            "contract_count": len(rows),
+        }
         return rows, [
-            ("contract", "Contract", "link_dynamic", ""),
-            ("tenant", "Tenant", "text", ""),
-            ("start", "Start", "date", ""),
-            ("end", "End", "date", ""),
-            ("monthly", "Monthly Rent", "money", ""),
-        ], {"rental_income": round(sum(r["monthly"] for r in rows), 2), "contract_count": len(rows)}, []
+            ("tenant_name", "Tenant Name", "link_dynamic", ""),
+            ("contract", "Contract ID", "link_dynamic", ""),
+            ("rental_income", "Rental Income Generated", "money", ""),
+        ], totals, []
 
     if kpi.startswith("revenue.invoiced_rent"):
         rows = ctx.invoices
@@ -698,30 +1040,40 @@ def _rows_for_kpi(ctx, kpi):
         ], {"vacant_60_plus": len(rows)}, []
 
     if kpi.startswith("vacancy.revenue_loss"):
-        return [], [], {}, []
+        # Drill-down: contributing vacant properties and their Potential Rent.
+        # Sum matches the Revenue Loss KPI card exactly.
+        rows = ctx.vacancy_rows()
+        return rows, [
+            ("property", "Property", "link", "Property"),
+            ("property_label", "Unit", "text", ""),
+            ("building", "Building", "text", ""),
+            ("building_block", "Block", "text", ""),
+            ("floor", "Floor", "text", ""),
+            ("revenue_loss", "Potential Rent / Month", "money", ""),
+        ], {"revenue_loss": round(sum(flt(r["revenue_loss"]) for r in rows), 2)}, []
 
     if kpi.startswith("vacancy.vacancy_rate"):
         return [], [], {}, []
 
     if kpi.startswith("contract_value.active_contracts"):
-        # One row per contract (MPRC parent if child RC belongs to one), no
-        # child expansion. Contracts effective on ctx.to_date.
-        seen = {}
-        for c in ctx.active_contracts_on(ctx.to_date):
-            mprc = c.get("multi_rent_contract_no") or c.get("mprc")
-            name = mprc or c["name"]
-            if name not in seen:
-                seen[name] = {
-                    "contract": name,
-                    "contract_doctype": "Multi Property Rent Contract" if mprc else "Rent Contract",
-                    "source_doctype": "Multi Property Rent Contract" if mprc else "Rent Contract",
-                    "source_name": mprc or c["name"],
-                    "tenant": c.get("tenant_name") or c.get("tenant") or "",
-                    "start": c.start,
-                    "end": c.end,
-                    "monthly": c.monthly,
-                }
-        rows = list(seen.values())
+        # One row per canonical contract (RC or MPRC parent), no child
+        # expansion. Only genuinely active (Occupied) contracts. Card and popup
+        # share the same canonical dataset, so both show identical results.
+        active = [c for c in ctx.canonical_contracts if c["status"] == "Occupied"]
+        rows = []
+        for g in active:
+            rows.append({
+                "contract": g["name"],
+                "contract_doctype": g["doctype"],
+                "source_doctype": g["doctype"],
+                "source_name": g["name"],
+                "tenant": g["tenant_name"],
+                "start": g["start"],
+                "end": g["end"],
+                "monthly": g["monthly"],
+                "property_label": g["property_label"],
+                "building": g["building"],
+            })
         return rows, [
             ("contract", "Contract", "link_dynamic", ""),
             ("tenant", "Tenant", "text", ""),
@@ -732,7 +1084,7 @@ def _rows_for_kpi(ctx, kpi):
 
     if kpi.startswith("contract_value.awaiting_renewal"):
         return ctx.expiries(), [
-            ("name", "Contract", "link", "Rent Contract"),
+            ("name", "Contract", "link_dynamic", ""),
             ("tenant", "Tenant", "text", ""),
             ("property_label", "Unit", "text", ""),
             ("building", "Building", "text", ""),
@@ -744,7 +1096,7 @@ def _rows_for_kpi(ctx, kpi):
     if kpi.startswith("contract_value.pre_booked"):
         rows = ctx.pre_booked()
         return rows, [
-            ("name", "Contract", "link", "Rent Contract"),
+            ("name", "Contract", "link_dynamic", ""),
             ("tenant", "Tenant", "text", ""),
             ("property_label", "Unit", "text", ""),
             ("building", "Building", "text", ""),
@@ -820,8 +1172,16 @@ def details_data(ctx, kpi, page=1, page_size=PAGE_SIZE_DEFAULT):
                 doctype = column.get("doctype")
                 name = row.get(key)
             elif column["type"] == "link_dynamic":
-                doctype = row.get("source_doctype") or row.get("doctype")
-                name = row.get("source_name") or row.get(key)
+                doctype = (
+                    row.get("{0}__doctype".format(key))
+                    or row.get("source_doctype")
+                    or row.get("doctype")
+                )
+                name = (
+                    row.get("{0}__docname".format(key))
+                    or row.get("source_name")
+                    or row.get(key)
+                )
             else:
                 continue
             if doctype and name:
@@ -938,15 +1298,10 @@ def revenue_data(ctx):
     outstanding = sum(flt(r.outstanding) for r in ctx.invoices)
     rate = 100 * collected / due if due else 0
     rental_income = 0.0
-    for c in ctx.contracts:
-        for month in _months_between(ctx.from_date, ctx.to_date):
-            seg_start = max(c.start, ctx.from_date, month)
-            seg_end = min(c.end, ctx.to_date, _month_end(month))
-            if seg_start > seg_end:
-                continue
-            days_in_month = _month_end(month).day
-            days = (seg_end - seg_start).days + 1
-            rental_income += flt(c.monthly) * days / days_in_month
+    income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
+    for g in ctx.contract_groups:
+        rental_income += income_by_group.get(g["key"], 0.0)
+    rental_income = round(rental_income, 2)
     return {
         "cards": [
             _card("revenue.rental_income_gl", "Rental Income", round(rental_income, 2), "Rent Contract", "Active RC monthly rent in period", "normal", "money"),
@@ -1052,21 +1407,43 @@ def vacancy_data(ctx):
 
 
 def contract_value_data(ctx):
-    active = ctx.active_contracts_on(ctx.to_date)
-    prebooked = ctx.pre_booked()
+    today = getdate()
+    canonical = ctx.canonical_contracts
+    active = [c for c in canonical if c["status"] == "Occupied"]
+    prebooked = [c for c in canonical if c["status"] == "Pre-Booked"]
+    expiries = [c for c in canonical
+                if c["end"] and today <= c["end"] <= add_days(today, 30)]
+
+    # Awaiting Renewal chart: canonical contracts expiring month-by-month over
+    # the next 12 months. Each RC / MPRC parent counted once, children never.
+    end_12m = add_months(today, 12)
+    monthly_expiries = defaultdict(int)
+    for c in canonical:
+        if c["end"] and today <= c["end"] <= end_12m:
+            monthly_expiries[c["end"].replace(day=1)] += 1
+    months = _months_between(today, end_12m)
+    awaiting_renewal_chart = [
+        {"month": _iso(m), "count": monthly_expiries.get(m, 0)}
+        for m in months
+    ]
+
     return {
         "cards": [
             _card("contract_value.active_contracts", "Active Contracts", len(active), "Rent Contract", unit="count"),
-            _card("contract_value.awaiting_renewal", "Awaiting Renewal", len(ctx.expiries()), "Rent Contract", "Expiring in next 30 days", "normal", "count"),
-            _card("contract_value.pre_booked", "Pre-Booked Contracts", len(prebooked), "Rent Contract", "Starts in next 12 months", "normal", "count"),
+            _card("contract_value.awaiting_renewal", "Awaiting Renewal", len(expiries), "Rent Contract", "Expiring in next 30 days", "normal", "count"),
+            _card("contract_value.pre_booked", "Pre-Booked Contracts", len(prebooked), "Rent Contract", "Status: Pre-Booked", "normal", "count"),
         ],
         "summary": {
             "active_contracts": len(active),
-            "awaiting_renewal": len(ctx.expiries()),
+            "awaiting_renewal": len(expiries),
             "pre_booked": len(prebooked),
+        },
+        "charts": {
+            "awaiting_renewal": awaiting_renewal_chart,
         },
         "tables": {
             "active_contracts": active,
+            "expiries": expiries,
             "pre_booked": prebooked,
         },
         "period": ctx.filters,
@@ -1103,6 +1480,13 @@ def vacancy_duration(ctx):
 
 
 def dashboard_data(tab, filters):
+    # Date filters apply only to Revenue & Collections. Other tabs show
+    # current overall status regardless of the selected date range, but the
+    # selected values are preserved in the UI when switching back.
+    if tab != "revenue":
+        filters = dict(filters)
+        filters["from_date"] = ""
+        filters["to_date"] = ""
     ctx = DashboardContext(filters)
     if not ctx.has_permission("Property"):
         frappe.throw(_("You do not have permission to read Property records."), frappe.PermissionError)
@@ -1162,6 +1546,13 @@ def get_dashboard(tab="overview", from_date="", to_date="", building="", buildin
 @frappe.whitelist()
 def get_kpi_details(kpi="", from_date="", to_date="", building="", building_block="", floor="", property="", page=1, page_size=25):
     """Return the reconciling rows for a KPI, with server response pagination."""
+    # Date filters apply only to Revenue & Collections KPIs. All other KPIs
+    # (overview / vacancy / contract_value) show current status and must not
+    # depend on From / To date, even when drilled down from a tab where dates
+    # were previously set.
+    if not kpi.startswith("revenue."):
+        from_date = ""
+        to_date = ""
     filters = _filters(from_date, to_date, building, building_block, floor, property)
     ctx = DashboardContext(filters)
     source_map = {
@@ -1181,8 +1572,9 @@ def get_kpi_details(kpi="", from_date="", to_date="", building="", building_bloc
     if not source:
         frappe.throw(_("Unknown KPI: {0}").format(kpi))
     # MPRC parents are permitted too: a Rent Contract child under an MPRC is
-    # allowed if the user can read the MPRC parent.
-    allow_mprc = kpi.startswith(("revenue.rental_income_gl", "contract_value.active_contracts"))
+    # allowed if the user can read the MPRC parent. All contract_value KPIs
+    # now read canonical contracts (RC + MPRC parent), so they need both.
+    allow_mprc = kpi.startswith(("revenue.rental_income_gl", "contract_value."))
     if not allow_mprc and not ctx.has_permission(source):
         return {
             "kpi": kpi,
