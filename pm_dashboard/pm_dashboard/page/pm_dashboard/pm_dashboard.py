@@ -58,7 +58,7 @@ _UNITS = """
         u.building_block AS building_block,
         COALESCE(b.building_name, u.building) AS property_name,
         CASE WHEN EXISTS (
-            SELECT 1 FROM `tabRent Contract` rc
+            SELECT 1 FROM `tabRent Contract Unit` rc
             WHERE rc.property = u.name AND rc.docstatus = 1
               AND rc.contract_end_date2 >= CURDATE()
               AND rc.status IN ('Occupied', 'Pre-Booked')
@@ -116,11 +116,11 @@ _VACANT_UNITS = """
         u.name AS unit,
         COALESCE(b.building_name, u.building) AS property_name,
         COALESCE(NULLIF(u.rent, 0),
-            (SELECT rc3.final_rent_amount FROM `tabRent Contract` rc3
+            (SELECT rc3.final_rent_amount FROM `tabRent Contract Unit` rc3
              WHERE rc3.property = u.name AND rc3.docstatus = 1
              ORDER BY rc3.contract_end_date2 DESC LIMIT 1), 0) AS est_rent,
         DATEDIFF(CURDATE(), COALESCE(
-            (SELECT MAX(rc2.contract_end_date2) FROM `tabRent Contract` rc2
+            (SELECT MAX(rc2.contract_end_date2) FROM `tabRent Contract Unit` rc2
              WHERE rc2.property = u.name AND rc2.docstatus = 1
                AND rc2.contract_end_date2 < CURDATE()),
             DATE(u.modified))) AS days_vacant
@@ -128,7 +128,7 @@ _VACANT_UNITS = """
     LEFT JOIN `tabBuilding` b ON b.name = u.building
     WHERE COALESCE(u.status, '') <> 'Rented'
       AND NOT EXISTS (
-        SELECT 1 FROM `tabRent Contract` rc
+        SELECT 1 FROM `tabRent Contract Unit` rc
         WHERE rc.property = u.name AND rc.docstatus = 1
           AND rc.contract_end_date2 >= CURDATE()
           AND rc.status IN ('Occupied', 'Pre-Booked'))
@@ -180,16 +180,16 @@ def _vacancy(errors, building="", building_block="", floor="", prop=""):
                COUNT(DISTINCT u.name) AS unit_count
         FROM `tabProperty` u
         LEFT JOIN `tabBuilding` b ON b.name = u.building
-        LEFT JOIN `tabRent Contract` rc ON rc.property = u.name AND rc.docstatus = 1
+        LEFT JOIN `tabRent Contract Unit` rc ON rc.property = u.name AND rc.docstatus = 1
         WHERE 1=1 """ + where + """
         GROUP BY COALESCE(b.building_name, u.building)
     """, values)
 
     tenants = _run(errors, "bottom_tenants", """
         SELECT COALESCE(c.customer_name, rc.tenant) AS entity_name,
-               COALESCE(SUM(CASE WHEN si.docstatus = 1 THEN si.grand_total ELSE 0 END), 0) AS metric_value,
+               COALESCE(SUM(CASE WHEN si.docstatus = 1 THEN si.grand_total * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END)) ELSE 0 END), 0) AS metric_value,
                COUNT(DISTINCT u.name) AS unit_count
-        FROM `tabRent Contract` rc
+        FROM `tabRent Contract Unit` rc
         JOIN `tabProperty` u ON u.name = rc.property
         LEFT JOIN `tabCustomer` c ON c.name = rc.tenant
         LEFT JOIN `tabSales Invoice` si ON si.rent_contract = rc.name
@@ -233,12 +233,12 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
     invoices = _run(errors, "invoices", """
         SELECT
             CONCAT(LEFT(si.posting_date, 7), '-01') AS period_month,
-            SUM(si.grand_total) AS revenue_amount,
-            SUM(si.outstanding_amount) AS outstanding_rent,
-            SUM(CASE WHEN """ + rent_case + """ THEN si.grand_total ELSE 0 END) AS rent_due,
-            SUM(CASE WHEN """ + rent_case + """ THEN si.outstanding_amount ELSE 0 END) AS rent_outstanding
+            SUM(si.grand_total * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END))) AS revenue_amount,
+            SUM(si.outstanding_amount * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END))) AS outstanding_rent,
+            SUM(CASE WHEN """ + rent_case + """ THEN si.grand_total * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END)) ELSE 0 END) AS rent_due,
+            SUM(CASE WHEN """ + rent_case + """ THEN si.outstanding_amount * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END)) ELSE 0 END) AS rent_outstanding
         FROM `tabSales Invoice` si
-        JOIN `tabRent Contract` rc ON rc.name = si.rent_contract
+        JOIN `tabRent Contract Unit` rc ON rc.name = si.rent_contract
         JOIN `tabProperty` u ON u.name = rc.property
         WHERE si.docstatus = 1 AND COALESCE(si.rent_contract, '') <> ''
         """ + unit_sql + inv_sql + """
@@ -248,12 +248,12 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
     payments = _run(errors, "payments", """
         SELECT
             CONCAT(LEFT(pe.posting_date, 7), '-01') AS period_month,
-            SUM(pe.paid_amount) AS collected_amount
+            SUM(pu.allocated_amount) AS collected_amount
         FROM `tabPayment Entry` pe
-        JOIN `tabRent Contract` rc ON rc.name = pe.rent_contract
-        JOIN `tabProperty` u ON u.name = rc.property
+        JOIN `tabRent Contract Multi Property` pu ON pu.parent=pe.name AND pu.parenttype='Payment Entry' AND pu.parentfield='custom_units_table'
+        JOIN `tabProperty` u ON u.name = pu.property
         WHERE pe.docstatus = 1 AND COALESCE(pe.mode_of_payment, '') <> 'PDC'
-          AND COALESCE(pe.rent_contract, '') <> ''
+          AND pe.is_property_payment=1
         """ + unit_sql + pay_sql + """
         GROUP BY CONCAT(LEFT(pe.posting_date, 7), '-01')
     """, values)
@@ -274,7 +274,7 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
 
     income = _run(errors, "income", """
         SELECT COALESCE(SUM(rc.final_rent_amount), 0) AS monthly_rental_income
-        FROM `tabRent Contract` rc
+        FROM `tabRent Contract Unit` rc
         JOIN `tabProperty` u ON u.name = rc.property
         WHERE rc.docstatus = 1 AND rc.status IN ('Occupied', 'Pre-Booked')
           AND rc.contract_end_date2 >= CURDATE()
@@ -298,9 +298,9 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
                  WHEN si.is_deposite_invoice = 1 THEN 'Deposit'
                  WHEN si.is_property_invoice = 1 THEN 'Rent'
                  ELSE 'Other' END AS revenue_category,
-            SUM(si.grand_total) AS revenue_amount
+            SUM(si.grand_total * (COALESCE((SELECT SUM(ABS(sii.base_net_amount)) FROM `tabSales Invoice Item` sii WHERE sii.parent=si.name AND sii.property=rc.property) / NULLIF((SELECT SUM(ABS(sii2.base_net_amount)) FROM `tabSales Invoice Item` sii2 WHERE sii2.parent=si.name),0), CASE WHEN rc.is_multi_property=1 THEN COALESCE(rc.monthly_payable_amount / NULLIF((SELECT SUM(ur.monthly_payable_amount) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name),0),1.0/(SELECT COUNT(*) FROM `tabRent Contract Unit` ur WHERE ur.name=rc.name)) ELSE 1 END))) AS revenue_amount
         FROM `tabSales Invoice` si
-        JOIN `tabRent Contract` rc ON rc.name = si.rent_contract
+        JOIN `tabRent Contract Unit` rc ON rc.name = si.rent_contract
         JOIN `tabProperty` u ON u.name = rc.property
         WHERE si.docstatus = 1 AND COALESCE(si.rent_contract, '') <> ''
         """ + unit_sql + inv_sql + """
@@ -317,7 +317,7 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
             DATEDIFF(rc.contract_end_date2, CURDATE()) AS days_to_expiry,
             rc.final_rent_amount AS rent_amount,
             LEFT(rc.contract_end_date2, 7) AS expiry_month
-        FROM `tabRent Contract` rc
+        FROM `tabRent Contract Unit` rc
         JOIN `tabProperty` u ON u.name = rc.property
         LEFT JOIN `tabBuilding` b ON b.name = u.building
         LEFT JOIN `tabCustomer` c ON c.name = rc.tenant
@@ -328,7 +328,7 @@ def _revenue(errors, from_date, to_date, building="", building_block="", floor="
 
     calendar = _run(errors, "calendar", """
         SELECT LEFT(rc.contract_end_date2, 7) AS expiry_month, COUNT(*) AS expiry_month_count
-        FROM `tabRent Contract` rc
+        FROM `tabRent Contract Unit` rc
         JOIN `tabProperty` u ON u.name = rc.property
         WHERE rc.docstatus = 1
         """ + unit_sql + ex_sql + """
