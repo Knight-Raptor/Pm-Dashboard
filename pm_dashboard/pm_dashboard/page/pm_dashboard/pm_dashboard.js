@@ -136,43 +136,113 @@ class PMDashboard {
     make_filters() {
         this.options = {};
         this.load_debounced = frappe.utils.debounce(() => this.load(), 300);
+
         const make = (df) => {
             const $container = $('<div class="pm-filter"></div>').appendTo(this.$filters);
             const control = frappe.ui.form.make_control({ parent: $container, df, render_input: true });
             control.refresh();
             return { control, $container };
         };
-        // Date filters are visible only on the Revenue & Collections tab.
-        // They stay inline in the same flex row as the other filters.
-        const from = make({ fieldname: 'from_date', label: __('From Date'), fieldtype: 'Date', change: () => this.load_debounced() });
+
+        // Default dates: First and last day of current month
+        const today = new Date();
+        const first_day = new Date(today.getFullYear(), today.getMonth(), 1);
+        const last_day = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+
+        const format_date = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+
+        // Date filters
+        const from = make({
+            fieldname: 'from_date',
+            label: __('From Date'),
+            fieldtype: 'Date',
+            change: () => this.load_debounced()
+        });
+
         this.from = from.control;
         this.$from_wrapper = from.$container;
-        const to = make({ fieldname: 'to_date', label: __('To Date'), fieldtype: 'Date', change: () => this.load_debounced() });
+
+        const to = make({
+            fieldname: 'to_date',
+            label: __('To Date'),
+            fieldtype: 'Date',
+            change: () => this.load_debounced()
+        });
+
         this.to = to.control;
         this.$to_wrapper = to.$container;
-        // No default date filters — start with no date range (all time)
+
+        // Set current month dates
+        this.from.set_value(format_date(first_day));
+        this.to.set_value(format_date(last_day));
 
         const narrow = (key) => () => {
             const values = (this.options[key] || []).map(row => row.value);
-            return values.length ? { filters: { name: ['in', values] } } : { filters: { name: ['=', '__none__'] } };
+            return values.length
+                ? { filters: { name: ['in', values] } }
+                : { filters: { name: ['=', '__none__'] } };
         };
+
         const cascade = () => this.load_options(() => this.load_debounced());
-        this.building = make({ fieldname: 'building', label: __('Building'), fieldtype: 'Link', options: 'Building', get_query: narrow('buildings'), change: cascade }).control;
-        this.block = make({ fieldname: 'building_block', label: __('Building Block'), fieldtype: 'Link', options: 'Building Block', get_query: narrow('building_blocks'), change: cascade }).control;
-        this.floor = make({ fieldname: 'floor', label: __('Floor'), fieldtype: 'Link', options: 'Floor', get_query: narrow('floors'), change: cascade }).control;
-        this.property = make({ fieldname: 'property', label: __('Property'), fieldtype: 'Link', options: 'Property', get_query: narrow('properties'), change: () => this.load_debounced() }).control;
+
+        this.building = make({
+            fieldname: 'building',
+            label: __('Building'),
+            fieldtype: 'Link',
+            options: 'Building',
+            get_query: narrow('buildings'),
+            change: cascade
+        }).control;
+
+        this.block = make({
+            fieldname: 'building_block',
+            label: __('Building Block'),
+            fieldtype: 'Link',
+            options: 'Building Block',
+            get_query: narrow('building_blocks'),
+            change: cascade
+        }).control;
+
+        this.floor = make({
+            fieldname: 'floor',
+            label: __('Floor'),
+            fieldtype: 'Link',
+            options: 'Floor',
+            get_query: narrow('floors'),
+            change: cascade
+        }).control;
+
+        this.property = make({
+            fieldname: 'property',
+            label: __('Property'),
+            fieldtype: 'Link',
+            options: 'Property',
+            get_query: narrow('properties'),
+            change: () => this.load_debounced()
+        }).control;
 
         $('<button type="button" class="btn btn-default btn-sm" style="margin-bottom:var(--margin-md,12px)"></button>')
             .text(__('Reset'))
             .appendTo(this.$filters)
             .on('click', () => {
-                this.from.set_value('');
-                this.to.set_value('');
-                [this.building, this.block, this.floor, this.property].forEach(control => control.set_value(''));
+                // Reset dates to current month
+                this.from.set_value(format_date(first_day));
+                this.to.set_value(format_date(last_day));
+
+                [this.building, this.block, this.floor, this.property]
+                    .forEach(control => control.set_value(''));
+
                 this.load_options(() => this.load());
             });
+
         this.load_options();
     }
+
 
     filters() {
         const from_date = this.from.get_value() || '';
@@ -395,7 +465,19 @@ class PMDashboard {
             <section class="pm-panel"><div class="pm-section-title"><h4>${__('Pre-Booked Contracts')}</h4><span>${prebooked.length} ${__('starting within 12 months')}</span></div>
                 ${this.table(['Tenant', 'Unit', 'Building', 'Monthly Rent', 'Start', 'End'], prebookedRows)}</section>`;
                 */
-    return ``;
+        const summary = data.summary || {};
+        const cmp = (data.charts && data.charts.rent_comparison) || [];
+        const subtitle = `${__('Potential')} ${this.money(summary.potential_rent)} · ${__('Actual')} ${this.money(summary.actual_rent)} KWD`;
+        return `
+            <section class="pm-panel">
+                <div class="pm-section-title">
+                    <h4>${__('Potential Rent vs Actual Rent')}</h4>
+                    <span>${this.esc(subtitle)}</span>
+                </div>
+                ${cmp.length
+                    ? `<div id="pm-chart-rent-comparison" class="pm-chart"></div>`
+                    : `<div class="pm-empty">${__('No rented properties for the selected filters.')}</div>`}
+            </section>`;
             }
 
     render_charts(data) {
@@ -436,6 +518,19 @@ class PMDashboard {
                 { name: __('Units'), values: duration.map(r => this.number(r.units)) }
             ]);
         } else if (this.tab === 'contract_value') {
+
+            // Potential vs Actual rent (rented properties only), grouped by building.
+            const rc = data.charts && data.charts.rent_comparison || [];
+            if (rc.length) {
+                this.make_chart('#pm-chart-rent-comparison', 'bar', ['#9ca3af', '#2f80ed'], rc.map(r => r.label), [
+                    { name: __('Potential Rent'), values: rc.map(r => this.number(r.potential_rent)) },
+                    { name: __('Actual Rent'), values: rc.map(r => this.number(r.actual_rent)) }
+                ], {
+                    barOptions: { spaceRatio: 0.35 },
+                    tooltipOptions: { formatTooltipY: value => `${this.money(value)} KWD` }
+                });
+            }
+
             // Awaiting Renewal chart: contracts expiring month by month.
             const ar = data.charts && data.charts.awaiting_renewal || [];
             if (ar.length) {
