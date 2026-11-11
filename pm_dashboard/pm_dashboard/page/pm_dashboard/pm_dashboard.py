@@ -215,7 +215,7 @@ class DashboardContext:
             names = {row.name: row.customer_name or row.name for row in rows}
         self._customers = names
         return names
-
+    
     @property
     def contracts(self):
         if self._contracts is not None:
@@ -224,29 +224,59 @@ class DashboardContext:
         if not property_names:
             self._contracts = []
             return self._contracts
+        visible = set(property_names)
 
         rows = self.list_rows(
             "Rent Contract",
-            {"docstatus": 1, "property": ["in", property_names]},
+            {"docstatus": 1},
             [
                 "name", "property", "building", "tenant", "tenant_name",
                 "contract_start_date", "contract_end_date", "monthly_payable_amount",
                 "status", "multi_rent_contract_no", "extension_parent",
+                "is_multi_property",
             ],
         )
-        contracts = []
-        for row in rows:
-            row["monthly"] = flt(row.monthly_payable_amount)
-            row["start"] = _date(row.contract_start_date)
-            row["end"] = _date(row.contract_end_date)
-            row["mprc"] = row.multi_rent_contract_no or ""
-            row["doctype"] = "Rent Contract"
-            row["document_name"] = row.name
-            contracts.append(row)
 
-        # MPRC child Rent Contract rows are never counted directly: each child
-        # property row is already the canonical property-level contract. The MPRC
-        # parent document itself is ignored everywhere, per your instruction.
+        # Child rows of merged multi-property Rent Contracts (property_details).
+        multi_names = [r.name for r in rows if r.get("is_multi_property")]
+        children = defaultdict(list)
+        if multi_names:
+            child_rows = frappe.db.sql(
+                """
+                SELECT parent, property, building, monthly_payable_amount
+                FROM `tabRent Contract Multi Property`
+                WHERE parenttype = 'Rent Contract'
+                  AND parent IN %(parents)s
+                """,
+                {"parents": tuple(multi_names)},
+                as_dict=True,
+            )
+            for ch in child_rows:
+                children[ch.parent].append(ch)
+
+        contracts = []
+
+        def add(row, prop, building, monthly):
+            c = frappe._dict(row.copy())
+            c["property"] = prop
+            c["building"] = building or row.get("building") or ""
+            c["monthly"] = flt(monthly)
+            c["start"] = _date(row.contract_start_date)
+            c["end"] = _date(row.contract_end_date)
+            c["mprc"] = row.multi_rent_contract_no or ""
+            c["doctype"] = "Rent Contract"
+            c["document_name"] = row.name
+            contracts.append(c)
+
+        for row in rows:
+            if row.get("is_multi_property"):
+                # Take property / building / rent from the property_details table.
+                for ch in children.get(row.name, []):
+                    if ch.property in visible:
+                        add(row, ch.property, ch.building, ch.monthly_payable_amount)
+            elif row.property in visible:
+                add(row, row.property, row.building, row.monthly_payable_amount)
+
         seen_contracts = set()
         unique = []
         for contract in contracts:
@@ -294,10 +324,18 @@ class DashboardContext:
                     "tenant_name": "",
                     "properties": [],
                     "buildings": set(),
+                    "_all_expired": True, 
                 }
                 order.append(key)
             g = groups[key]
             g["monthly"] += flt(c.monthly)
+            # A member counts as expired if its stored status says so, or its
+            # end date is already in the past.
+            member_expired = (
+                (c.get("status") or "").strip().lower() == "expired"
+                or (c.end and c.end < getdate())
+            )
+            g["_all_expired"] = g["_all_expired"] and bool(member_expired)
             if c.start and (g["start"] is None or c.start < g["start"]):
                 g["start"] = c.start
             if c.end and (g["end"] is None or c.end > g["end"]):
@@ -319,6 +357,7 @@ class DashboardContext:
         for key in order:
             g = groups[key]
             g.pop("_tenants_seen", None)
+            g["status"] = "Expired" if g.pop("_all_expired", False) else "Active"
             if not g["tenant_name"] and g["tenant"]:
                 g["tenant_name"] = customers.get(g["tenant"], g["tenant"])
             g["building"] = (
@@ -912,13 +951,15 @@ def _rows_for_kpi(ctx, kpi):
         ], {"expiring_30d": len(rows)}, []
 
     if kpi.startswith("revenue.rental_income_gl"):
-        # Exactly three columns: Tenant Name, Contract ID, Rental Income Generated.
-        # One row per contract (RC or its MPRC parent), never child-expanded.
-        # Income is the prorated period rental income per group, shared with the
-        # Rental Income card so the popup total always matches the KPI value.
         income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
         rows = []
+        included_income = 0.0
         for g in ctx.contract_groups:
+            # Skip expired contracts entirely (don't show them in the popup)
+            if (g.get("status") or "").strip().lower() == "expired":
+                continue
+            income = income_by_group.get(g["key"], 0.0)
+            included_income += income
             rows.append({
                 "tenant_name": g["tenant_name"],
                 "tenant": g["tenant"],
@@ -930,10 +971,10 @@ def _rows_for_kpi(ctx, kpi):
                 "tenant_name__docname": g["tenant"] or g["tenant_name"],
                 "contract__doctype": g["doctype"],
                 "contract__docname": g["name"],
-                "rental_income": income_by_group.get(g["key"], 0.0),
+                "rental_income": income,
             })
         totals = {
-            "rental_income": round(sum(income_by_group.values()), 2),
+            "rental_income": round(included_income, 2),
             "contract_count": len(rows),
         }
         return rows, [
@@ -941,7 +982,6 @@ def _rows_for_kpi(ctx, kpi):
             ("contract", "Contract ID", "link_dynamic", ""),
             ("rental_income", "Rental Income Generated", "money", ""),
         ], totals, []
-
     if kpi.startswith("revenue.invoiced_rent"):
         rows = ctx.invoices
         return rows, [
@@ -1317,6 +1357,8 @@ def revenue_data(ctx):
     rental_income = 0.0
     income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
     for g in ctx.contract_groups:
+        if g.get("status") == "Expired":
+            continue
         rental_income += income_by_group.get(g["key"], 0.0)
     rental_income = round(rental_income, 2)
     return {
@@ -1402,7 +1444,7 @@ def vacancy_data(ctx):
             _card("vacancy.vacant_units", "Vacant Units", vacant, "Property", unit="count"),
             _card("vacancy.vacancy_rate", "Vacancy Rate", round(100 * vacant / total, 2) if total else 0, "Property", unit="percent"),
             _card("vacancy.days_60_plus", "Vacant 60+ Days", vacant_60, "Property", unit="count"),
-            _card("vacancy.revenue_loss", "Revenue Loss", loss, "Property", "Based on Property Potential Rent only", "data-gap" if missing else "normal", "money"),
+            _card("vacancy.revenue_loss", "Revenue Loss", loss, "Property", "Based on Property Potential Rent only (Monthly)", "data-gap" if missing else "normal", "money"),
         ],
         "summary": {
             "total_units": total,
@@ -1443,6 +1485,7 @@ def contract_value_data(ctx):
         {"month": _iso(m), "count": monthly_expiries.get(m, 0)}
         for m in months
     ]
+    rent_cmp = rent_comparison(ctx)
 
     return {
         "cards": [
@@ -1454,9 +1497,12 @@ def contract_value_data(ctx):
             "active_contracts": len(active),
             "awaiting_renewal": len(expiries),
             "pre_booked": len(prebooked),
+            "potential_rent": round(sum(r["potential_rent"] for r in rent_cmp), 2),
+            "actual_rent": round(sum(r["actual_rent"] for r in rent_cmp), 2),
         },
         "charts": {
             "awaiting_renewal": awaiting_renewal_chart,
+            "rent_comparison": rent_cmp,
         },
         "tables": {
             "active_contracts": active,
@@ -1467,7 +1513,6 @@ def contract_value_data(ctx):
         "errors": ctx.errors,
         "exceptions": ctx._exceptions,
     }
-
 
 def vacancy_by_building(ctx):
     grouped = defaultdict(int)
@@ -1480,6 +1525,41 @@ def vacancy_by_building(ctx):
         for b, n in sorted(grouped.items())
     ]
 
+def rent_comparison(ctx):
+    """Potential rent (Property.rent) vs actual rent (active Rent Contract
+    monthly rent), for Rented properties only, grouped by building."""
+    today = getdate()
+
+    # Actual monthly rent per property from contracts active today.
+    actual_by_property = defaultdict(float)
+    for c in ctx.contracts:
+        if c.start and c.end and c.start <= today <= c.end:
+            actual_by_property[c.property] += flt(c.monthly)
+
+    labels = ctx.building_labels()
+    grouped = {}
+    for p in ctx.properties:
+        if p.status != "Rented":
+            continue
+        key = p.building or "Unknown"
+        row = grouped.setdefault(key, {
+            "building": key,
+            "label": labels.get(key, key),
+            "units": 0,
+            "potential_rent": 0.0,
+            "actual_rent": 0.0,
+        })
+        row["units"] += 1
+        row["potential_rent"] += flt(p.rent)
+        row["actual_rent"] += actual_by_property.get(p.name, 0.0)
+
+    data = []
+    for row in sorted(grouped.values(), key=lambda r: r["label"]):
+        row["potential_rent"] = round(row["potential_rent"], 2)
+        row["actual_rent"] = round(row["actual_rent"], 2)
+        row["difference"] = round(row["actual_rent"] - row["potential_rent"], 2)
+        data.append(row)
+    return data
 
 def vacancy_duration(ctx):
     buckets = {"0-30": 0, "31-60": 0, "61-90": 0, "90+": 0}
