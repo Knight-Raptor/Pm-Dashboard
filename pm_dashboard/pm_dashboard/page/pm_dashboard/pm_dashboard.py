@@ -411,15 +411,13 @@ class DashboardContext:
 
     @property
     def canonical_contracts(self):
-        """One canonical row per normal Rent Contract and per Multi Property
-        Rent Contract parent.
+        """One canonical row per submitted Rent Contract.
 
-        Normal RCs: docstatus=1, not an MPRC child (multi_rent_contract_no empty).
-        MPRC parents: docstatus=1 Multi Property Rent Contract, with properties
-        resolved from the Rent Contract Multi Property child table. A parent is
-        included when at least one of its properties matches the location filters
-        (or when no location filter is set). Its child RC records are never
-        counted as independent contracts.
+        Rent Contract is the center of truth: there is no RC vs MPRC split
+        anymore. Properties come from the header ``property`` field for
+        single-unit contracts and from the ``property_details`` child table
+        for multi-unit contracts. MPRC child Rent Contracts are excluded
+        (multi_rent_contract_no set) and counted under their parent only.
 
         Status follows the app's own lifecycle: start > today -> Pre-Booked,
         end < today -> Expired, otherwise Occupied.
@@ -435,55 +433,51 @@ class DashboardContext:
             if t and t not in tenant_ids:
                 tenant_ids.append(t)
 
-        # --- Normal Rent Contracts (exclude MPRC children) ---
+        # --- All submitted Rent Contracts (exclude MPRC children) ---
+        # Rent Contract is the center of truth: there is no RC vs MPRC split
+        # anymore. Properties come from the header ``property`` field for
+        # single-unit contracts and from the ``property_details`` child table
+        # for multi-unit contracts.
         property_names = self.property_names
-        rc_rows = []
-        if property_names:
-            rc_rows = self.list_rows(
-                "Rent Contract",
-                {
-                    "docstatus": 1,
-                    "property": ["in", property_names],
-                    "multi_rent_contract_no": ["", ""],
-                },
-                [
-                    "name", "property", "building", "tenant", "tenant_name",
-                    "contract_start_date", "contract_end_date", "monthly_payable_amount",
-                ],
-            )
-            for row in rc_rows:
-                add_tenant(row.tenant)
-
-        # --- MPRC Parents ---
-        mprc_rows = self.list_rows(
-            "Multi Property Rent Contract",
-            {"docstatus": 1},
-            ["name", "tenant", "contract_start_date", "contract_end_date", "monthly_payable_amount"],
+        rc_rows = self.list_rows(
+            "Rent Contract",
+            {
+                "docstatus": 1,
+                "multi_rent_contract_no": ["", ""],
+            },
+            [
+                "name", "property", "building", "tenant", "tenant_name",
+                "is_multi_property",
+                "contract_start_date", "contract_end_date", "monthly_payable_amount",
+            ],
         )
-        mprc_properties = defaultdict(list)
-        mprc_buildings = defaultdict(set)
-        if mprc_rows:
-            mprc_names = [r.name for r in mprc_rows]
-            if self.has_permission("Rent Contract Multi Property"):
-                prop_rows = frappe.db.sql(
-                    """
-                    SELECT parent, property, building
-                    FROM `tabRent Contract Multi Property`
-                    WHERE parent IN %(parents)s
-                    """,
-                    {"parents": tuple(mprc_names)},
-                    as_dict=True,
-                )
-                for pr in prop_rows:
-                    if pr.property:
-                        mprc_properties[pr.parent].append(pr.property)
-                    if pr.building:
-                        mprc_buildings[pr.parent].add(pr.building)
-            for row in mprc_rows:
-                add_tenant(row.tenant)
+        for row in rc_rows:
+            add_tenant(row.tenant)
 
-        # Resolve customer names (MPRC parents and RC children have tenant as
-        # a Customer link; tenant_name may be NULL on child records).
+        # Child-table properties for multi-unit contracts, loaded once.
+        multi_names = [r.name for r in rc_rows if r.get("is_multi_property")]
+        rc_properties = defaultdict(list)
+        rc_buildings = defaultdict(set)
+        if multi_names:
+            prop_rows = frappe.db.sql(
+                """
+                SELECT parent, property, building
+                FROM `tabRent Contract Multi Property`
+                WHERE parenttype = 'Rent Contract'
+                  AND parentfield = 'property_details'
+                  AND parent IN %(parents)s
+                """,
+                {"parents": tuple(multi_names)},
+                as_dict=True,
+            )
+            for pr in prop_rows:
+                if pr.property:
+                    rc_properties[pr.parent].append(pr.property)
+                if pr.building:
+                    rc_buildings[pr.parent].add(pr.building)
+
+        # Resolve customer names (RC children have tenant as a Customer link;
+        # tenant_name may be NULL on child records).
         customers = {}
         if tenant_ids and self.has_permission("Customer"):
             cust_rows = self.list_rows(
@@ -493,18 +487,32 @@ class DashboardContext:
 
         has_location = _has_location_filter(self.filters)
 
-        # Build normal RC rows.
         for row in rc_rows:
             start = _date(row.contract_start_date)
             end = _date(row.contract_end_date)
-            props = [row.property] if row.property else []
-            buildings = {row.building} if row.building else set()
+            if row.get("is_multi_property"):
+                props = list(rc_properties.get(row.name, []))
+                buildings = rc_buildings.get(row.name, set())
+            else:
+                props = [row.property] if row.property else []
+                buildings = {row.building} if row.building else set()
+            # Location filters: keep the contract only if at least one of its
+            # resolved properties matches (or no filter is set).
+            if has_location:
+                visible_props = [p for p in props if self._prop_matches_filters(p)]
+                if not visible_props:
+                    continue
+                props = visible_props
+            building = (
+                next(iter(buildings)) if len(buildings) == 1
+                else ("Multiple" if buildings else "")
+            )
             contracts.append({
                 "name": row.name,
                 "document_name": row.name,
                 "doctype": "Rent Contract",
-                "property": row.property or "",
-                "building": row.building or "",
+                "property": "",
+                "building": building,
                 "tenant": row.tenant or "",
                 "tenant_name": row.tenant_name or customers.get(row.tenant, row.tenant or ""),
                 "contract_start_date": row.contract_start_date,
@@ -519,45 +527,8 @@ class DashboardContext:
                 "buildings": buildings,
             })
 
-        # Build MPRC parent rows.
-        for row in mprc_rows:
-            start = _date(row.contract_start_date)
-            end = _date(row.contract_end_date)
-            props = list(mprc_properties.get(row.name, []))
-            # Apply location filters: keep the parent only if at least one of
-            # its properties is visible under the current filters.
-            if has_location:
-                visible_props = [p for p in props if self._prop_matches_filters(p)]
-                if not visible_props:
-                    continue
-                props = visible_props
-            buildings = mprc_buildings.get(row.name, set())
-            building = (
-                next(iter(buildings)) if len(buildings) == 1
-                else ("Multiple" if buildings else "")
-            )
-            contracts.append({
-                "name": row.name,
-                "document_name": row.name,
-                "doctype": "Multi Property Rent Contract",
-                "property": "",
-                "building": building,
-                "tenant": row.tenant or "",
-                "tenant_name": customers.get(row.tenant, row.tenant or ""),
-                "contract_start_date": row.contract_start_date,
-                "contract_end_date": row.contract_end_date,
-                "monthly_payable_amount": flt(row.monthly_payable_amount),
-                "monthly": flt(row.monthly_payable_amount),
-                "start": start,
-                "end": end,
-                "status": self._contract_status(start, end),
-                "mprc": "",
-                "properties": props,
-                "buildings": buildings,
-            })
-
         # Attach property_label to each contract (single unit -> apt_no/name;
-        # MPRC with multiple units -> "N units").
+        # multi-unit -> "N units").
         for c in contracts:
             props = c.get("properties") or []
             if len(props) == 1 and props[0]:
