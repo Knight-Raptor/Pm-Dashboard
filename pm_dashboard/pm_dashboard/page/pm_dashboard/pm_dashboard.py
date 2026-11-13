@@ -136,6 +136,8 @@ class DashboardContext:
         self._contract_groups = None
         self._canonical_contracts = None
         self._invoices = None
+        self._estimated_lease_invoices = None
+        self._trailing_invoices = None
         self._customers = None
         self._exceptions = []
 
@@ -630,17 +632,36 @@ class DashboardContext:
                     continue
                 invoice_property = ", ".join(visible_parts)
             building = ""
+            prop_row = None
             if invoice_property:
                 parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
                 visible_parts = [p for p in parts if p in self.property_map]
                 if visible_parts:
-                    building = self.property_map[visible_parts[0]].building or ""
+                    prop_row = self.property_map[visible_parts[0]]
+                    building = prop_row.building or ""
                 if not building:
                     building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
             else:
                 building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
-            if has_location and self.filters["building"] and building != self.filters["building"]:
-                continue
+            # Apply all location filters explicitly: building, building_block,
+            # floor, property. self.property_map only holds properties matching
+            # all active filters, so prop_row being set means the invoice passes.
+            if has_location:
+                if self.filters.get("building"):
+                    inv_building = prop_row.building if prop_row else building
+                    if inv_building != self.filters["building"]:
+                        continue
+                if self.filters.get("building_block"):
+                    inv_block = prop_row.building_block if prop_row else ""
+                    if inv_block != self.filters["building_block"]:
+                        continue
+                if self.filters.get("floor"):
+                    inv_floor = prop_row.floor if prop_row else ""
+                    if inv_floor != self.filters["floor"]:
+                        continue
+                if self.filters.get("property"):
+                    if not prop_row:
+                        continue
             row = frappe._dict(inv.copy())
             row.update({
                 "property": invoice_property or "",
@@ -699,6 +720,222 @@ class DashboardContext:
 
         self._invoices = output
         return self._invoices
+
+    @property
+    def estimated_lease_invoices(self):
+        """Rent Sales Invoices (draft + submitted) for the Estimated Lease Revenue KPI.
+
+        Unlike ``invoices`` this includes draft invoices (docstatus = 0) as well as
+        submitted ones (docstatus = 1), filtered by posting date within From/To
+        and by the location filters. Used for the Estimated Lease Revenue card.
+        """
+        if self._estimated_lease_invoices is not None:
+            return self._estimated_lease_invoices
+        rows = self.list_rows(
+            "Sales Invoice",
+            {
+                "docstatus": ["in", (0, 1)],
+                "is_property_invoice": 1,
+                "invoice_type": "Rent",
+                "is_return": 0,
+                "posting_date": ["between", [self.filters["from_date"], self.filters["to_date"]]],
+            },
+            [
+                "name", "posting_date", "due_date", "customer", "customer_name",
+                "grand_total", "outstanding_amount", "status", "property", "building",
+                "rent_contract", "contract_no", "multi_rent_contract_no",
+                "period_start_date", "period_end_date", "cost_center",
+            ],
+        )
+        contract_map = {c["name"]: c for c in self.contracts}
+        mprc_contracts = defaultdict(list)
+        for c in self.contracts:
+            if c.get("mprc"):
+                mprc_contracts[c["mprc"]].append(c)
+        cost_center_buildings = {}
+        if self.has_permission("Building"):
+            for b in self.list_rows("Building", {}, ["name", "cost_center"]):
+                if b.cost_center:
+                    cost_center_buildings[b.cost_center] = b.name
+
+        has_location = _has_location_filter(self.filters)
+        output = []
+        for inv in rows:
+            invoice_property = inv.property
+            if not invoice_property:
+                rc = contract_map.get(inv.rent_contract or inv.contract_no)
+                if rc:
+                    invoice_property = rc.property
+            if not invoice_property:
+                mprc_name = inv.multi_rent_contract_no or inv.contract_no or ""
+                if mprc_name and mprc_name in mprc_contracts:
+                    visible = [
+                        c.property for c in mprc_contracts[mprc_name]
+                        if c.property and c.property in self.property_map
+                    ]
+                    if visible:
+                        invoice_property = ", ".join(visible)
+                    elif not has_location or not self.filters.get("building"):
+                        invoice_property = ""
+            if invoice_property and invoice_property not in self.property_map:
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if not visible_parts:
+                    continue
+                invoice_property = ", ".join(visible_parts)
+            building = ""
+            prop_row = None
+            if invoice_property:
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if visible_parts:
+                    prop_row = self.property_map[visible_parts[0]]
+                    building = prop_row.building or ""
+                if not building:
+                    building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
+            else:
+                building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
+            if has_location:
+                if self.filters.get("building"):
+                    inv_building = prop_row.building if prop_row else building
+                    if inv_building != self.filters["building"]:
+                        continue
+                if self.filters.get("building_block"):
+                    inv_block = prop_row.building_block if prop_row else ""
+                    if inv_block != self.filters["building_block"]:
+                        continue
+                if self.filters.get("floor"):
+                    inv_floor = prop_row.floor if prop_row else ""
+                    if inv_floor != self.filters["floor"]:
+                        continue
+                if self.filters.get("property"):
+                    if not prop_row:
+                        continue
+            row = frappe._dict(inv.copy())
+            row.update({
+                "property": invoice_property or "",
+                "building": building,
+                "due": flt(inv.grand_total),
+                "collected": 0.0,
+                "outstanding": flt(inv.outstanding_amount),
+            })
+            output.append(row)
+
+        self._estimated_lease_invoices = output
+        return output
+
+    @property
+    def trailing_invoices(self):
+        """All unpaid rent invoices irrespective of posting date.
+
+        Unlike ``invoices`` this is not windowed by From/To date: it returns
+        every submitted rent invoice (invoice_type = Rent) that still has an
+        outstanding balance, filtered only by the location filters (building /
+        building_block / floor / property). Used for the Trailing Outstanding
+        Rent KPI so carried-forward dues are visible even when they fall
+        outside the selected period.
+        """
+        if self._trailing_invoices is not None:
+            return self._trailing_invoices
+        rows = self.list_rows(
+            "Sales Invoice",
+            {
+                "docstatus": 1,
+                "is_property_invoice": 1,
+                "invoice_type": "Rent",
+                "is_return": 0,
+                "outstanding_amount": [">", 0],
+                # Trailing outstanding = unpaid rent invoices posted before the
+                # selected From date. When no From date is set, self.from_date
+                # defaults to 1900-01-01 so nothing matches (no trailing to show).
+                "posting_date": ["<", self.from_date],
+            },
+            [
+                "name", "posting_date", "due_date", "customer", "customer_name",
+                "grand_total", "outstanding_amount", "status", "property", "building",
+                "rent_contract", "contract_no", "multi_rent_contract_no",
+                "period_start_date", "period_end_date", "cost_center",
+            ],
+        )
+        contract_map = {c["name"]: c for c in self.contracts}
+        mprc_contracts = defaultdict(list)
+        for c in self.contracts:
+            if c.get("mprc"):
+                mprc_contracts[c["mprc"]].append(c)
+        cost_center_buildings = {}
+        if self.has_permission("Building"):
+            for b in self.list_rows("Building", {}, ["name", "cost_center"]):
+                if b.cost_center:
+                    cost_center_buildings[b.cost_center] = b.name
+
+        has_location = _has_location_filter(self.filters)
+        output = []
+        for inv in rows:
+            invoice_property = inv.property
+            if not invoice_property:
+                rc = contract_map.get(inv.rent_contract or inv.contract_no)
+                if rc:
+                    invoice_property = rc.property
+            if not invoice_property:
+                mprc_name = inv.multi_rent_contract_no or inv.contract_no or ""
+                if mprc_name and mprc_name in mprc_contracts:
+                    visible = [
+                        c.property for c in mprc_contracts[mprc_name]
+                        if c.property and c.property in self.property_map
+                    ]
+                    if visible:
+                        invoice_property = ", ".join(visible)
+                    elif not has_location or not self.filters.get("building"):
+                        invoice_property = ""
+            if invoice_property and invoice_property not in self.property_map:
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if not visible_parts:
+                    continue
+                invoice_property = ", ".join(visible_parts)
+            building = ""
+            prop_row = None
+            if invoice_property:
+                parts = [p.strip() for p in invoice_property.split(",") if p.strip()]
+                visible_parts = [p for p in parts if p in self.property_map]
+                if visible_parts:
+                    prop_row = self.property_map[visible_parts[0]]
+                    building = prop_row.building or ""
+                if not building:
+                    building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
+            else:
+                building = inv.building or cost_center_buildings.get(inv.cost_center) or ""
+            # Apply all location filters explicitly: building, building_block,
+            # floor, property. self.property_map only holds properties matching
+            # all active filters, so prop_row being set means the invoice passes.
+            if has_location:
+                if self.filters.get("building"):
+                    inv_building = prop_row.building if prop_row else building
+                    if inv_building != self.filters["building"]:
+                        continue
+                if self.filters.get("building_block"):
+                    inv_block = prop_row.building_block if prop_row else ""
+                    if inv_block != self.filters["building_block"]:
+                        continue
+                if self.filters.get("floor"):
+                    inv_floor = prop_row.floor if prop_row else ""
+                    if inv_floor != self.filters["floor"]:
+                        continue
+                if self.filters.get("property"):
+                    if not prop_row:
+                        continue
+            row = frappe._dict(inv.copy())
+            row.update({
+                "property": invoice_property or "",
+                "building": building,
+                "due": flt(inv.grand_total),
+                "collected": 0.0,
+                "outstanding": flt(inv.outstanding_amount),
+            })
+            output.append(row)
+
+        self._trailing_invoices = output
+        return output
 
     def active_contracts_on(self, target_date):
         """Contracts effective on target_date, one per property."""
@@ -922,37 +1159,21 @@ def _rows_for_kpi(ctx, kpi):
         ], {"expiring_30d": len(rows)}, []
 
     if kpi.startswith("revenue.rental_income_gl"):
-        income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
-        rows = []
-        included_income = 0.0
-        for g in ctx.contract_groups:
-            # Skip expired contracts entirely (don't show them in the popup)
-            if (g.get("status") or "").strip().lower() == "expired":
-                continue
-            income = income_by_group.get(g["key"], 0.0)
-            included_income += income
-            rows.append({
-                "tenant_name": g["tenant_name"],
-                "tenant": g["tenant"],
-                "contract": g["name"],
-                "contract_doctype": g["doctype"],
-                "source_doctype": g["doctype"],
-                "source_name": g["name"],
-                "tenant_name__doctype": "Customer",
-                "tenant_name__docname": g["tenant"] or g["tenant_name"],
-                "contract__doctype": g["doctype"],
-                "contract__docname": g["name"],
-                "rental_income": income,
-            })
-        totals = {
-            "rental_income": round(included_income, 2),
-            "contract_count": len(rows),
-        }
+        rows = ctx.estimated_lease_invoices
         return rows, [
-            ("tenant_name", "Tenant Name", "link_dynamic", ""),
-            ("contract", "Contract ID", "link_dynamic", ""),
-            ("rental_income", "Rental Income Generated", "money", ""),
-        ], totals, []
+            ("name", "Rent Invoice", "link", "Sales Invoice"),
+            ("posting_date", "Posting Date", "date", ""),
+            ("due_date", "Due Date", "date", ""),
+            ("customer_name", "Tenant", "text", ""),
+            ("property", "Property", "text", ""),
+            ("building", "Building", "text", ""),
+            ("due", "Invoiced Amount", "money", ""),
+            ("outstanding", "Still Outstanding", "money", ""),
+            ("status", "Status", "text", ""),
+        ], {
+            "rental_income": round(sum(r.due for r in rows), 2),
+            "invoice_count": len(rows),
+        }, []
     if kpi.startswith("revenue.invoiced_rent"):
         rows = ctx.invoices
         return rows, [
@@ -995,7 +1216,7 @@ def _rows_for_kpi(ctx, kpi):
             ("property", "Property", "text", ""),
             ("building", "Building", "text", ""),
             ("allocated", "Allocated", "money", ""),
-            ("cash_received", "Cash Received", "money", ""),
+            ("cash_received", "Amount Received", "money", ""),
         ], {
             "collected": round(sum(r["allocated"] for r in rows), 2),
             "payment_count": len({r["payment"] for r in rows}),
@@ -1018,6 +1239,22 @@ def _rows_for_kpi(ctx, kpi):
             "invoiced_rent": round(sum(r.due for r in ctx.invoices), 2),
             "collected": round(sum(r.collected for r in ctx.invoices), 2),
             "outstanding": round(sum(r.outstanding for r in rows), 2),
+        }, []
+
+    if kpi.startswith("revenue.trailing_outstanding"):
+        rows = ctx.trailing_invoices
+        return rows, [
+            ("name", "Rent Invoice", "link", "Sales Invoice"),
+            ("posting_date", "Posting Date", "date", ""),
+            ("due_date", "Due Date", "date", ""),
+            ("customer_name", "Tenant", "text", ""),
+            ("property", "Property", "text", ""),
+            ("building", "Building", "text", ""),
+            ("due", "Invoiced Amount", "money", ""),
+            ("outstanding", "Still Outstanding", "money", ""),
+            ("status", "Status", "text", ""),
+        ], {
+            "trailing_outstanding": round(sum(r.outstanding for r in rows), 2),
         }, []
 
     if kpi.startswith("revenue.collection_rate"):
@@ -1324,27 +1561,31 @@ def revenue_data(ctx):
     due = sum(flt(r.due) for r in ctx.invoices)
     collected = sum(flt(r.collected) for r in ctx.invoices)
     outstanding = sum(flt(r.outstanding) for r in ctx.invoices)
+    trailing_outstanding = sum(flt(r.outstanding) for r in ctx.trailing_invoices)
+    # Estimated Lease Revenue: draft + submitted rent Sales Invoices in period.
+    rental_income = round(sum(flt(r.due) for r in ctx.estimated_lease_invoices), 2)
     rate = 100 * collected / due if due else 0
-    rental_income = 0.0
-    income_by_group = ctx.rental_income_by_group(ctx.from_date, ctx.to_date)
-    for g in ctx.contract_groups:
-        if g.get("status") == "Expired":
-            continue
-        rental_income += income_by_group.get(g["key"], 0.0)
-    rental_income = round(rental_income, 2)
+    cards = [
+        _card("revenue.rental_income_gl", "Estimated Lease Revenue", round(rental_income, 2), "Sales Invoice", "Draft + submitted rent invoices in period", "normal", "money"),
+        _card("revenue.trailing_outstanding", "Previous Outstanding Rent", round(trailing_outstanding, 2), "Sales Invoice", "All unpaid rent invoices posted before From Date", "normal", "money"),
+        _card("revenue.invoiced_rent", "Rental Income Invoice", round(due, 2), "Sales Invoice", "Submitted rent invoices in period", "normal", "money"),
+        _card("revenue.collected", "Rental Collection", round(collected, 2), "Payment Entry", "Allocations against period invoices", "normal", "money"),
+        _card("revenue.outstanding", "Outstanding Rent for Period", round(outstanding, 2), "Sales Invoice", "Invoiced minus collected in period", "normal", "money"),
+        _card("revenue.collection_rate", "Collection Rate", round(rate, 2), "Sales Invoice", "Collected ÷ Rent Due", "normal", "percent"),
+    ]
+    # Row 1: 2 cards (wide), Row 2: 4 cards (standard).
+    for c in cards[:2]:
+        c["row"] = 1
+    for c in cards[2:]:
+        c["row"] = 2
     return {
-        "cards": [
-            _card("revenue.rental_income_gl", "Estimated Lease Revenue", round(rental_income, 2), "Rent Contract", "Active RC monthly rent in period", "normal", "money"),
-            _card("revenue.invoiced_rent", "Rental Income Invoice", round(due, 2), "Sales Invoice", "Submitted rent invoices in period", "normal", "money"),
-            _card("revenue.collected", "Rental Collection", round(collected, 2), "Payment Entry", "Allocations against period invoices", "normal", "money"),
-            _card("revenue.outstanding", "Outstanding Rent", round(outstanding, 2), "Sales Invoice", "Invoiced minus collected", "normal", "money"),
-            _card("revenue.collection_rate", "Collection Rate", round(rate, 2), "Sales Invoice", "Collected ÷ Rent Due", "normal", "percent"),
-        ],
+        "cards": cards,
         "summary": {
             "rental_income": round(rental_income, 2),
             "invoiced_rent": round(due, 2),
             "collected": round(collected, 2),
             "outstanding": round(outstanding, 2),
+            "trailing_outstanding": round(trailing_outstanding, 2),
             "collection_rate": round(rate, 2),
         },
         "charts": {"monthly": monthly_trend(ctx)},
@@ -1369,11 +1610,7 @@ def monthly_trend(ctx):
             days_in_month = _month_end(month).day
             days = (seg_end - seg_start).days + 1
             rentals[month] += flt(c.monthly) * days / days_in_month
-    for inv in ctx.invoices:
-        month = getdate(inv.posting_date).replace(day=1)
-        invoiced[month] += flt(inv.due)
-        collected_m[month] += flt(inv.collected)
-        outstanding_m[month] += flt(inv.outstanding)
+    # Build the month list for the chart window (needed before invoicing loop).
     months = _months_between(ctx.from_date, ctx.to_date)
     # When no date filter is set, show only the last 24 months from today so
     # the chart stays performant and readable (not 1900-2100).
@@ -1387,6 +1624,12 @@ def monthly_trend(ctx):
             months.append(m)
             m = _add_months(m, -1)
         months = sorted(months)
+    for inv in ctx.invoices:
+        month = getdate(inv.posting_date).replace(day=1)
+        if month in months:
+            invoiced[month] += flt(inv.due)
+            collected_m[month] += flt(inv.collected)
+            outstanding_m[month] += flt(inv.outstanding)
     return [
         {
             "month": _iso(month),
@@ -1628,6 +1871,7 @@ def get_kpi_details(kpi="", from_date="", to_date="", building="", building_bloc
         "revenue.invoiced_rent": "Sales Invoice",
         "revenue.collected": "Payment Entry",
         "revenue.outstanding": "Sales Invoice",
+        "revenue.trailing_outstanding": "Sales Invoice",
         "revenue.collection_rate": "Sales Invoice",
     }
     source = source_map.get(kpi)
