@@ -348,10 +348,24 @@ class PMDashboard {
             let content;
             if (!cards.length) {
                 content = `<div class="pm-cards"><div class="pm-panel pm-empty">${__('No data available for these filters.')}</div></div>`;
-            } else if (this.tab === 'overview' && cards.some(card => card.row)) {
+            } else if ((this.tab === 'overview' || this.tab === 'revenue') && cards.some(card => card.row)) {
                 // Overview: row 1 = area cards (4 across), row 2 = unit cards (3 across)
-                content = grid(cards.filter(card => card.row === 1), 'pm-cards')
-                    + grid(cards.filter(card => card.row === 2), 'pm-cards pm-six');
+                // Revenue: row 1 = 2 wide cards (50% each), row 2 = 4 standard cards (25% each)
+                const row1 = cards.filter(card => card.row === 1);
+                const row2 = cards.filter(card => card.row === 2);
+                let content1 = '';
+                let content2 = '';
+                if (row1.length) {
+                    if (this.tab === 'revenue' && row1.length === 2) {
+                        content1 = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--pm-gap);">${row1.map(card => this.card_html(card)).join('')}</div>`;
+                    } else {
+                        content1 = grid(row1, 'pm-cards');
+                    }
+                }
+                if (row2.length) {
+                    content2 = grid(row2, this.tab === 'revenue' ? 'pm-cards' : 'pm-cards pm-six');
+                }
+                content = content1 + content2;
             } else {
                 const cardClass = (this.tab === 'overview' || this.tab === 'revenue') ? 'pm-cards pm-six' : 'pm-cards';
                 content = grid(cards, cardClass);
@@ -432,7 +446,7 @@ class PMDashboard {
                 <section class="pm-panel"><div class="pm-section-title"><h4>${__('Vacancy Duration')}</h4><span>${__('Buckets sum to vacant units')}</span></div><div id="pm-chart-vacancy-duration" class="pm-chart"></div></section>
             </div>
             <section class="pm-panel"><div class="pm-section-title"><h4>${__('Vacant Property Register')}</h4><span>${rows.length} ${__('units')}</span></div>
-                ${this.table(['Unit', 'Building', 'Block', 'Floor', 'Start (Est.)', 'Days', 'Potential Rent', 'Loss', 'Pre-Booked', 'Data'], rowData)}</section>`;
+                ${this.table(['Unit', 'Building', 'Block', 'Floor', 'Start (Est.)', 'Days', 'Potential Rent', 'Loss', 'Pre-Booked', 'Missing Rent'], rowData)}</section>`;
     }
 
     render_contracts_overview(data) {
